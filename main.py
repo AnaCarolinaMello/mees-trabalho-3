@@ -55,13 +55,14 @@ class GitHubAnalyzer:
     def create_prs_query(self, owner, name, cursor=None):
         """
         Cria a query GraphQL para buscar PRs de um repositório específico
+        Ordena por número de reviews (descendente)
         """
         after_clause = f', after: "{cursor}"' if cursor else ""
         
         query = f"""
         query {{
             repository(owner: "{owner}", name: "{name}") {{
-                pullRequests(states: [MERGED, CLOSED], first: 20{after_clause}) {{
+                pullRequests(states: [MERGED, CLOSED], first:20{after_clause}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{
                     pageInfo {{
                         hasNextPage
                         endCursor
@@ -194,7 +195,6 @@ class GitHubAnalyzer:
         repositories = []
         cursor = None
         collected = 0
-        total_analyzed = 0
         
         print(f"Buscando repositórios populares com 100+ PRs...")
         print(f"Alvo: {limit} repositórios válidos")
@@ -211,8 +211,6 @@ class GitHubAnalyzer:
             repos = search_results['nodes']
             
             for repo in repos:
-                total_analyzed += 1
-                
                 if collected >= limit:
                     break
                     
@@ -231,11 +229,8 @@ class GitHubAnalyzer:
                     collected += 1
                     
                     if collected % 10 == 0:
-                        print(f"Coletados {collected}/{limit} repositórios válidos (analisados {total_analyzed} total)")
-                else:
-                    if total_analyzed % 50 == 0:
-                        print(f"Analisados {total_analyzed} repositórios, encontrados {collected} válidos (>= 100 PRs)")
-            
+                        print(f"Coletados {collected}/{limit} repositórios válidos ({(collected/limit)*100:.1f}%)")
+
             if not search_results['pageInfo']['hasNextPage'] or collected >= limit:
                 break
                 
@@ -243,10 +238,10 @@ class GitHubAnalyzer:
             time.sleep(1)
             
         print(f"\nRESULTADO DA COLETA:")
-        print(f"  Total analisados: {total_analyzed} repositórios")
+        print(f"  Total analisados: {collected} repositórios")
         print(f"  Válidos coletados: {len(repositories)} repositórios (>= 100 PRs)")
-        if total_analyzed > 0:
-            print(f"  Taxa de aprovação: {len(repositories)/total_analyzed*100:.1f}%")
+        if collected > 0:
+            print(f"  Taxa de aprovação: {len(repositories)/collected*100:.1f}%")
         else:
             print(f"  Taxa de aprovação: N/A (nenhum repositório analisado)")
         
@@ -292,7 +287,7 @@ class GitHubAnalyzer:
             'has_code_review': pr['reviews']['totalCount'] > 0
         }
     
-    def collect_pull_requests_data(self, repositories, max_prs_per_repo=100):
+    def collect_pull_requests_data(self, repositories, limit=100):
         """
         Coleta dados de Pull Requests dos repositórios selecionados
         """
@@ -306,15 +301,10 @@ class GitHubAnalyzer:
             
             cursor = None
             collected_prs = 0
-            analyzed_prs = 0
             
-            while collected_prs < max_prs_per_repo:
+            while collected_prs < limit:
                 query = self.create_prs_query(repo['owner'], repo['name'], cursor)
                 response_data = self.make_request(query)
-                print(response_data)
-
-                if collected_prs % 10 == 0:
-                    print(f"Coletados {collected_prs}/{max_prs_per_repo} PRs (analisados {analyzed_prs} total)")
 
                 if not response_data or 'data' not in response_data:
                     print(f"  Erro ao obter PRs de {repo['name']}")
@@ -327,29 +317,35 @@ class GitHubAnalyzer:
                 pr_data = response_data['data']['repository']['pullRequests']
                 prs = pr_data['nodes']
                 
-                for pr in prs:
-                    analyzed_prs += 1
-                    
-                    if collected_prs >= max_prs_per_repo:
+                # Filtrar PRs com pelo menos 1 review
+                filtered_prs = [pr for pr in prs if pr['reviews']['totalCount'] >= 1]
+                
+                # Ordenar por número de reviews (descendente)
+                filtered_prs.sort(key=lambda x: x['reviews']['totalCount'], reverse=True)
+                
+                for pr in filtered_prs:
+                    if collected_prs >= limit:
                         break
                     
                     try:
-                        # Filtrar apenas PRs que passaram por code review
-                        if pr['reviews']['totalCount'] > 0:
-                            processed_pr = self.process_pull_request_data(pr, repo)
+                        processed_pr = self.process_pull_request_data(pr, repo)
+                        if ((processed_pr['pr_lifetime_hours'] is not None and processed_pr['pr_lifetime_hours'] >= 1) or
+                            (processed_pr['pr_time_to_merge_hours'] is not None and processed_pr['pr_time_to_merge_hours'] >= 1)):
                             all_prs.append(processed_pr)
                             collected_prs += 1
+                            if collected_prs % 10 == 0:
+                                print(f"Coletados {collected_prs}/{limit} PRs ({(collected_prs/limit)*100:.1f}%)")
                     except Exception as e:
                         print(f"  Erro ao processar PR #{pr.get('number', 'Unknown')}: {e}")
                         continue
                 
-                if not pr_data['pageInfo']['hasNextPage'] or collected_prs >= max_prs_per_repo:
+                if not pr_data['pageInfo']['hasNextPage'] or collected_prs >= limit:
                     break
                     
                 cursor = pr_data['pageInfo']['endCursor']
                 time.sleep(1)
             
-            print(f"  Analisados {analyzed_prs} PRs, coletados {collected_prs} com code review (filtro: {collected_prs/analyzed_prs*100:.1f}%)" if analyzed_prs > 0 else "  Nenhum PR analisado")
+            print(f"  PRs {collected_prs} coletados, com code review ({(collected_prs/limit)*100:.1f}%)")
             
             if i % 10 == 0:
                 print(f"Progresso geral: {i}/{total_repos} repositórios processados, {len(all_prs)} PRs coletados")
@@ -357,7 +353,12 @@ class GitHubAnalyzer:
             # Pausa entre repositórios para evitar rate limit
             time.sleep(2)
         
-        print(f"Coleta finalizada. Total: {len(all_prs)} PRs com code review")
+        print(f"Coleta finalizada. Total: {len(all_prs)} PRs com pelo menos 1 review")
+        
+        # Ordenar todos os PRs por número de reviews (descendente)
+        all_prs.sort(key=lambda x: x['pr_reviews_count'], reverse=True)
+        print(f"PRs ordenados por número de reviews (maior para menor)")
+        
         return all_prs
     
     def save_to_csv(self, pull_requests, filename="pull_requests_code_review.csv"):
@@ -640,7 +641,7 @@ def main():
 
     # Etapa 1: Coletar repositórios populares com 100+ PRs
     print("=== ETAPA 1: Coletando repositórios populares ===")
-    repositories = analyzer.collect_popular_repositories(limit=5)
+    repositories = analyzer.collect_popular_repositories(limit=200)
     
     if not repositories:
         print("Falha na coleta de repositórios.")
@@ -648,7 +649,7 @@ def main():
     
     # Etapa 2: Coletar PRs com code review destes repositórios
     print("\n=== ETAPA 2: Coletando Pull Requests com code review ===")
-    pull_requests = analyzer.collect_pull_requests_data(repositories, max_prs_per_repo=100)
+    pull_requests = analyzer.collect_pull_requests_data(repositories, limit=100)
     
     if pull_requests:
         # Salvar dados
@@ -664,8 +665,8 @@ def main():
         print(f"Total de PRs coletados: {len(pull_requests):,}")
         print(f"Repositórios analisados: {len(repositories)}")
         print("Arquivo gerado: pull_requests_code_review.csv")
-        print("\nO dataset contém PRs que passaram por code review dos")
-        print("repositórios mais populares do GitHub.")
+        print("\nO dataset contém PRs com code review dos")
+        print("repositórios mais populares do GitHub (>=100 PRs), ordenados por número de reviews.")
         
         # Estatísticas finais
         merged_count = sum(1 for pr in pull_requests if pr['pr_is_merged'])
